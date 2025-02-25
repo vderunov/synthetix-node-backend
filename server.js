@@ -795,6 +795,96 @@ app.get('/generated-keys', authenticateToken, async (req, res, next) => {
   }
 });
 
+app.get('/cids', authenticateToken, async (req, res, next) => {
+  try {
+    if (!req.query.key) {
+      return next(new HttpError('Key missed.', 400));
+    }
+
+    res.status(200).json({
+      cids: await getCidsFromGeneratedKey({
+        walletAddress: req.user.walletAddress,
+        key: req.query.key,
+      }),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/remove-cid', authenticateToken, async (req, res, next) => {
+  try {
+    const { cid, key } = req.body;
+
+    if (!cid) {
+      return next(new HttpError('CID missed.', 400));
+    }
+    if (!key) {
+      return next(new HttpError('Key missed.', 400));
+    }
+
+    const response = await fetch(`${IPFS_CLUSTER_URL}api/v0/pin/rm?arg=${cid}`, { method: 'POST' });
+    if (!response.ok) {
+      throw new HttpError(`Failed to remove CID ${cid} from IPFS`);
+    }
+
+    await deleteCidFromGeneratedKey({
+      walletAddress: req.user.walletAddress,
+      key,
+      cid,
+    });
+
+    res.status(200).json({ success: true, cid });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const addCidToGeneratedKey = ({ walletAddress, key, cid }) => {
+  return new Promise((resolve) => {
+    gun
+      .get(generateHash(walletAddress.toLowerCase()))
+      .get('generated-keys')
+      .get(key)
+      .get('cids')
+      .get(cid)
+      .put({ cid }, resolve);
+  });
+};
+
+const getCidsFromGeneratedKey = ({ walletAddress, key }) => {
+  return new Promise((resolve) => {
+    gun
+      .get(generateHash(walletAddress.toLowerCase()))
+      .get('generated-keys')
+      .get(key)
+      .get('cids')
+      .once((node) => {
+        if (!node) {
+          return resolve([]);
+        }
+
+        const cids = Object.entries(removeMetaData(node))
+          .filter(([_, value]) => value !== null)
+          .map(([key]) => key);
+
+        resolve(cids);
+      });
+  });
+};
+
+const deleteCidFromGeneratedKey = ({ walletAddress, key, cid }) => {
+  return new Promise((resolve) => {
+    gun
+      .get(generateHash(walletAddress.toLowerCase()))
+      .get('generated-keys')
+      .get(key)
+      .get('cids')
+      .get(cid)
+      .put(null, resolve);
+  });
+};
+
 app.use(
   '/api/v0/dag/import',
   authenticateToken,
@@ -805,13 +895,18 @@ app.use(
     },
     selfHandleResponse: true,
     on: {
-      proxyRes: responseInterceptor(async (responseBuffer, _proxyRes, _req, res) => {
+      proxyRes: responseInterceptor(async (responseBuffer, _proxyRes, req, res) => {
         try {
           res.removeHeader('trailer');
           if (_proxyRes.statusCode < 400) {
             const cid = JSON.parse(responseBuffer.toString('utf8')).Root?.Cid['/'];
             if (cid) {
               await fetch(`${IPFS_CLUSTER_URL}api/v0/pin/add?arg=${cid}`, { method: 'POST' });
+              await addCidToGeneratedKey({
+                walletAddress: req.user.walletAddress,
+                key: req.query.key,
+                cid,
+              });
             }
           }
         } catch (e) {
